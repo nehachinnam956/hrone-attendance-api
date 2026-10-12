@@ -16,7 +16,7 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import ASCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
@@ -32,7 +32,13 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def create_indexes():
+    # One employee per emp_code; enforces 409 on concurrent duplicate creates.
     db.employees.create_index("emp_code", unique=True)
+    # At most one record per (employee, attendance day); makes punch-in race-safe.
+    # Also serves "one employee's records in a date range" queries.
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True
+    )
 
 
 @asynccontextmanager
@@ -99,11 +105,14 @@ def shift_bounds(day: date, emp: dict) -> tuple[datetime, datetime]:
     return start, end
 
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def compute_late_minutes(punch_in: datetime, day: date, emp: dict) -> int:
+    """R2: late only if strictly more than 10:00 after shift start;
+    then whole minutes (floor) since shift start, not since grace end."""
+    start, _ = shift_bounds(day, emp)
+    secs = int((punch_in - start).total_seconds())
+    if secs <= 600:
+        return 0
+    return secs // 60
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -200,22 +209,24 @@ def punch_in(body: PunchInIn):
     if not emp:
         raise HTTPException(404, "employee not found")
     ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
-    d = attendance_date(ts, emp).isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    day = attendance_date(ts, emp)
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": day.isoformat(),
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, day, emp),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
+    # No check-then-insert: the unique (emp_code, date) index decides the race.
+    try:
+        res = db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
     return doc
