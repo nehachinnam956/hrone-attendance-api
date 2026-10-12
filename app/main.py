@@ -16,7 +16,7 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
@@ -38,6 +38,13 @@ def create_indexes():
     # Also serves "one employee's records in a date range" queries.
     db.attendance_logs.create_index(
         [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True
+    )
+    # GET /attendance with no filter or only a date range: same shape as the sort
+    # (date desc, emp_code asc), so Mongo walks the index in order - no in-memory sort.
+    db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
+    # GET /attendance?status=...: equality on status, then already in sort order.
+    db.attendance_logs.create_index(
+        [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)]
     )
 
 
@@ -125,6 +132,27 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     return max(0, int((punch_out - end).total_seconds() / 60))
 
 
+def validation_error(field: str, msg: str, loc: str = "query") -> HTTPException:
+    """422 in FastAPI's default shape: {"detail": [{loc, msg, type}]}."""
+    return HTTPException(
+        status_code=422,
+        detail=[{"loc": [loc, field], "msg": msg, "type": "value_error"}],
+    )
+
+
+def parse_date_param(field: str, value: Optional[str]) -> Optional[str]:
+    """Accept only a real YYYY-MM-DD date; return it unchanged (dates are stored as strings)."""
+    if value is None:
+        return None
+    try:
+        if len(value) != 10:
+            raise ValueError
+        date.fromisoformat(value)
+    except ValueError:
+        raise validation_error(field, "must be a valid date YYYY-MM-DD")
+    return value
+
+
 # --------------------------------------------------------------------------- #
 # Response shaping: the API never exposes _id, and every instant is epoch ms
 # --------------------------------------------------------------------------- #
@@ -182,6 +210,8 @@ DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 # Epoch milliseconds range: below 1e11 looks like seconds; above is after year 2100
 MIN_MS = 100_000_000_000
 MAX_MS = 4_102_444_800_000
+
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
 
 class EmployeeIn(BaseModel):
@@ -278,15 +308,15 @@ def punch_in(body: PunchInIn):
     return record_out(doc)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-):
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def build_attendance_query(emp_code, date_from, date_to, status) -> dict:
+    """Shared by GET /attendance and the explain endpoint, so both run the same query."""
+    date_from = parse_date_param("date_from", date_from)
+    date_to = parse_date_param("date_to", date_to)
+    if date_from and date_to and date_from > date_to:
+        raise validation_error("date_from", "date_from must be on or before date_to")
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
@@ -298,13 +328,28 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    return q
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = build_attendance_query(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q)
+        .sort(ATTENDANCE_SORT)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    items = [record_out(d) for d in cursor]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
