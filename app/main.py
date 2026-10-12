@@ -63,6 +63,7 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 UTC = timezone.utc
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 MAX_SHIFT = timedelta(hours=24)
+PRESENCE = {"PRESENT", "WFH", "ON_DUTY"}
 
 
 def ms_to_dt(ms: int) -> datetime:
@@ -79,8 +80,10 @@ def dt_to_ms(dt: Optional[datetime]) -> Optional[int]:
     return (dt - EPOCH) // timedelta(milliseconds=1)
 
 
-def as_utc(dt: datetime) -> datetime:
+def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """Make sure a datetime read from Mongo is aware (defensive; tz_aware=True already does this)."""
+    if dt is None:
+        return None
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
@@ -153,6 +156,23 @@ def is_half_day(work_hours: Optional[float]) -> bool:
     return work_hours is not None and work_hours < 4.5
 
 
+def derive_fields(status: str, pin: Optional[datetime], pout: Optional[datetime],
+                  day: date, emp: dict) -> dict:
+    """All four derived fields for a record, from its final status and punch times (R2-R5)."""
+    if status not in PRESENCE:
+        return {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    late = compute_late_minutes(pin, day, emp)
+    if pout is None:
+        return {"work_hours": None, "late_minutes": late, "overtime_minutes": 0, "half_day": False}
+    wh = compute_work_hours(pin, pout)
+    return {
+        "work_hours": wh,
+        "late_minutes": late,
+        "overtime_minutes": compute_overtime(pout, day, emp),
+        "half_day": is_half_day(wh),
+    }
+
+
 def validation_error(field: str, msg: str, loc: str = "query") -> HTTPException:
     """422 in FastAPI's default shape: {"detail": [{loc, msg, type}]}."""
     return HTTPException(
@@ -161,7 +181,7 @@ def validation_error(field: str, msg: str, loc: str = "query") -> HTTPException:
     )
 
 
-def parse_date_param(field: str, value: Optional[str]) -> Optional[str]:
+def parse_date_param(field: str, value: Optional[str], loc: str = "query") -> Optional[str]:
     """Accept only a real YYYY-MM-DD date; return it unchanged (dates are stored as strings)."""
     if value is None:
         return None
@@ -170,7 +190,7 @@ def parse_date_param(field: str, value: Optional[str]) -> Optional[str]:
             raise ValueError
         date.fromisoformat(value)
     except ValueError:
-        raise validation_error(field, "must be a valid date YYYY-MM-DD")
+        raise validation_error(field, "must be a valid date YYYY-MM-DD", loc)
     return value
 
 
@@ -266,6 +286,24 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[StrictInt] = Field(None, ge=MIN_MS, le=MAX_MS)
+
+
+class RegularizeIn(BaseModel):
+    """Only status / punch_in / punch_out can change. Derived fields sent by a client
+    are not declared here, so pydantic ignores them (contract: 'ignore it')."""
+    status: Optional[Status] = None
+    punch_in: Optional[StrictInt] = Field(None, ge=MIN_MS, le=MAX_MS)
+    punch_out: Optional[StrictInt] = Field(None, ge=MIN_MS, le=MAX_MS)
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def no_explicit_nulls(self):
+        # Omitted means "unchanged"; an explicit null is not a valid value in the contract.
+        for f in ("status", "punch_in", "punch_out"):
+            if f in self.model_fields_set and getattr(self, f) is None:
+                raise ValueError(f"{f} may be omitted but not null")
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -380,6 +418,90 @@ def punch_out(body: PunchOutIn):
     return record_out(rec)
 
 
+def attendance_date_from_str(s: str) -> date:
+    """Module-level so it can be used where a parameter named `date` hides the class."""
+    return date.fromisoformat(s)
+
+
+TRACKED_FIELDS = (
+    "status", "punch_in", "punch_out",
+    "work_hours", "late_minutes", "overtime_minutes", "half_day",
+)
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: str, body: RegularizeIn):
+    # NOTE: the path parameter must be called `date` (contract), which hides the
+    # datetime.date class inside this function, so date parsing uses module helpers.
+    parse_date_param("date", date, loc="path")
+    day = attendance_date_from_str(date)
+
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not rec:
+        raise HTTPException(404, "no attendance record for that date")
+
+    # Current values, with legacy defaults (missing -> 0 / false / null).
+    old = {
+        "status": rec["status"],
+        "punch_in": as_utc(rec.get("punch_in")),
+        "punch_out": as_utc(rec.get("punch_out")),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0,
+        "half_day": bool(rec.get("half_day", False)),
+    }
+    sent = body.model_fields_set  # fields the client actually supplied
+
+    # 1. Final status and punch times (omitted fields stay unchanged).
+    status = body.status if "status" in sent else old["status"]
+    if status not in PRESENCE:
+        # ABSENT / LEAVE: both punch times are cleared; supplying one is a contradiction.
+        if "punch_in" in sent or "punch_out" in sent:
+            raise validation_error("status", f"{status} cannot have punch times", loc="body")
+        pin = pout = None
+    else:
+        pin = ms_to_dt(body.punch_in) if "punch_in" in sent else old["punch_in"]
+        pout = ms_to_dt(body.punch_out) if "punch_out" in sent else old["punch_out"]
+        if pin is None:
+            raise validation_error("punch_in", f"{status} requires a punch_in", loc="body")
+        if attendance_date(pin, emp) != day:
+            raise validation_error("punch_in", "punch_in must stay on the record's attendance date", loc="body")
+        if pout is not None and (pout <= pin or pout - pin > MAX_SHIFT):
+            raise validation_error("punch_out", "punch_out must be after punch_in and within 24 hours", loc="body")
+
+    # 2. Recompute derived fields from the final values (R2-R5).
+    new = {"status": status, "punch_in": pin, "punch_out": pout}
+    new.update(derive_fields(status, pin, pout, day, emp))
+
+    # 3. Only fields that actually changed go into the history entry.
+    changes = {f: {"from": old[f], "to": new[f]} for f in TRACKED_FIELDS if old[f] != new[f]}
+    if not changes:
+        raise validation_error("body", "request changes nothing", loc="body")
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # 4. Optimistic concurrency: apply only if nobody changed the record since we read it.
+    #    "history.<n>" not existing means the history still has exactly n entries
+    #    (entries are never removed). $push appends, so no entry is ever overwritten.
+    n = len(rec.get("history") or [])
+    guard = {
+        "_id": rec["_id"],
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        f"history.{n}": {"$exists": False},
+    }
+    res = db.attendance_logs.update_one(guard, {"$set": new, "$push": {"history": entry}})
+    if res.matched_count == 0:
+        raise HTTPException(409, "record was changed by another request; retry")
+
+    rec.update(new)
+    rec["history"] = (rec.get("history") or []) + [entry]
+    return record_out(rec)
+
+
 ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
 
 
@@ -426,7 +548,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - Part B (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
