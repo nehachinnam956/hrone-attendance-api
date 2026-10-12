@@ -1,16 +1,13 @@
 """
-Employee Attendance & Analytics API - STARTER
+Employee Attendance & Analytics API
 
 Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
+Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience; real env vars win)
 """
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
@@ -19,14 +16,15 @@ from pydantic import BaseModel, Field, StrictInt, field_validator, model_validat
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
 
-load_dotenv()
+load_dotenv()  # override=False: real environment variables take priority over .env
 
-client = MongoClient(
-    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
-    serverSelectionTimeoutMS=5000,
-    tz_aware=True,
-)
-db = client[os.getenv("MONGO_DB", "attendance_db")]
+MONGO_URI = os.environ.get("MONGO_URI")
+MONGO_DB = os.environ.get("MONGO_DB")
+if not MONGO_URI or not MONGO_DB:
+    raise RuntimeError("MONGO_URI and MONGO_DB must be set (environment or .env)")
+
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, tz_aware=True)
+db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -122,14 +120,29 @@ def compute_late_minutes(punch_in: datetime, day: date, emp: dict) -> int:
     return secs // 60
 
 
+def round_half_up(value: Decimal, places: int = 2) -> float:
+    """R4/R8: decimal half-up rounding (not banker's, not float rounding)."""
+    quantum = Decimal(1).scaleb(-places)  # places=2 -> Decimal("0.01")
+    return float(value.quantize(quantum, rounding=ROUND_HALF_UP))
+
+
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    """R4: (punch_out - punch_in) seconds / 3600, 2 decimals half-up."""
+    secs = int((punch_out - punch_in).total_seconds())
+    return round_half_up(Decimal(secs) / Decimal(3600), 2)
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_overtime(punch_out: datetime, day: date, emp: dict) -> int:
+    """R3: whole minutes (floor) from shift end to punch_out, only if >= 30; else 0.
+    Shift end comes from shift_bounds, so overnight shifts end on the next day."""
+    _, end = shift_bounds(day, emp)
+    minutes = int((punch_out - end).total_seconds()) // 60
+    return minutes if minutes >= 30 else 0
+
+
+def is_half_day(work_hours: Optional[float]) -> bool:
+    """R5: half day when the ROUNDED work_hours < 4.50."""
+    return work_hours is not None and work_hours < 4.5
 
 
 def validation_error(field: str, msg: str, loc: str = "query") -> HTTPException:
@@ -243,7 +256,7 @@ class PunchInIn(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints provided
+# System and employees
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
@@ -281,6 +294,9 @@ def list_employees(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+# --------------------------------------------------------------------------- #
+# Attendance
+# --------------------------------------------------------------------------- #
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
@@ -353,7 +369,7 @@ def list_attendance(
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
+# TODO - Part B (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
