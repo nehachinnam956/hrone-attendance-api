@@ -9,22 +9,27 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 from pymongo import MongoClient
-from contextlib import asynccontextmanager
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), serverSelectionTimeoutMS=5000)
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    serverSelectionTimeoutMS=5000,
+    tz_aware=True,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
 
 def create_indexes():
     db.employees.create_index("emp_code", unique=True)
@@ -42,6 +47,58 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+UTC = timezone.utc
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def ms_to_dt(ms: int) -> datetime:
+    """Epoch ms -> aware UTC datetime, truncated to whole seconds (R1)."""
+    return datetime.fromtimestamp(ms // 1000, tz=UTC)
+
+
+def dt_to_ms(dt: Optional[datetime]) -> Optional[int]:
+    """Aware/naive-UTC datetime -> epoch ms (exact integer math, no float error)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (dt - EPOCH) // timedelta(milliseconds=1)
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
+
+
+def hhmm(s: str) -> tuple[int, int]:
+    h, m = s.split(":")
+    return int(h), int(m)
+
+
+def attendance_date(punch_in: datetime, emp: dict) -> date:
+    """R1: IST date of the punch; for overnight shifts, a punch before shift_end
+    belongs to the shift that started the previous day."""
+    local = punch_in.astimezone(IST)
+    day = local.date()
+    overnight = emp["shift_end"] <= emp["shift_start"]
+    if overnight:
+        eh, em = hhmm(emp["shift_end"])
+        if (local.hour, local.minute, local.second) < (eh, em, 0):
+            day -= timedelta(days=1)
+    return day
+
+
+def shift_bounds(day: date, emp: dict) -> tuple[datetime, datetime]:
+    """Shift start and end as aware IST datetimes for the given attendance date.
+    For overnight shifts the end falls on the next calendar day (R1)."""
+    sh, sm = hhmm(emp["shift_start"])
+    eh, em = hhmm(emp["shift_end"])
+    start = datetime(day.year, day.month, day.day, sh, sm, tzinfo=IST)
+    end = datetime(day.year, day.month, day.day, eh, em, tzinfo=IST)
+    if end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -65,6 +122,10 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
 DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 
+# Epoch milliseconds range: below 1e11 looks like seconds; above is after year 2100
+MIN_MS = 100_000_000_000
+MAX_MS = 4_102_444_800_000
+
 
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
@@ -78,7 +139,7 @@ class EmployeeIn(BaseModel):
     @field_validator("joined_on")
     @classmethod
     def real_date(cls, v):
-        date.fromisoformat(v)   # "2026-02-30" raises ValueError -> 422
+        date.fromisoformat(v)  # "2026-02-30" raises ValueError -> 422
         return v
 
     @model_validator(mode="after")
@@ -90,8 +151,8 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[StrictInt] = Field(None, ge=MIN_MS, le=MAX_MS)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
@@ -109,7 +170,7 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
+    doc["created_at"] = now_utc()
     try:
         db.employees.insert_one(doc)
     except DuplicateKeyError:
@@ -120,10 +181,10 @@ def create_employee(body: EmployeeIn):
 
 @app.get("/employees")
 def list_employees(
-       department: Optional[str] = None,
-       page: int = Query(1, ge=1),
-       page_size: int = Query(20, ge=1, le=100),
-   ):
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
     q = {}
     if department:
         q["department"] = department
@@ -136,8 +197,10 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+    d = attendance_date(ts, emp).isoformat()
     if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
         raise HTTPException(409, "already punched in for this date")
     doc = {
