@@ -44,6 +44,8 @@ def create_indexes():
     db.attendance_logs.create_index(
         [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)]
     )
+    # Punch-out: "this employee's latest punch_in at or before T".
+    db.attendance_logs.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)])
 
 
 @asynccontextmanager
@@ -60,6 +62,7 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 UTC = timezone.utc
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+MAX_SHIFT = timedelta(hours=24)
 
 
 def ms_to_dt(ms: int) -> datetime:
@@ -74,6 +77,11 @@ def dt_to_ms(dt: Optional[datetime]) -> Optional[int]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return (dt - EPOCH) // timedelta(milliseconds=1)
+
+
+def as_utc(dt: datetime) -> datetime:
+    """Make sure a datetime read from Mongo is aware (defensive; tz_aware=True already does this)."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 def now_utc() -> datetime:
@@ -255,6 +263,11 @@ class PunchInIn(BaseModel):
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(None, ge=MIN_MS, le=MAX_MS)
+
+
 # --------------------------------------------------------------------------- #
 # System and employees
 # --------------------------------------------------------------------------- #
@@ -324,6 +337,49 @@ def punch_in(body: PunchInIn):
     return record_out(doc)
 
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+
+    # Latest record whose punch_in is at or before the punch-out time.
+    # Works across midnight: an overnight record dated yesterday is found by its punch_in.
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": ts}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if not rec:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+
+    pin = as_utc(rec["punch_in"])
+    if ts <= pin:
+        raise validation_error("punched_at", "punch-out must be after punch-in", loc="body")
+    if ts - pin > MAX_SHIFT:
+        raise validation_error("punched_at", "punch-out must be within 24 hours of punch-in", loc="body")
+
+    day = date.fromisoformat(rec["date"])
+    work_hours = compute_work_hours(pin, ts)
+    update = {
+        "punch_out": ts,
+        "work_hours": work_hours,
+        "overtime_minutes": compute_overtime(ts, day, emp),
+        "half_day": is_half_day(work_hours),
+    }
+    # Conditional update: only succeeds if the record is STILL open.
+    # Two simultaneous punch-outs -> one matches, the other matches nothing -> 409.
+    res = db.attendance_logs.update_one(
+        {"_id": rec["_id"], "punch_out": None}, {"$set": update}
+    )
+    if res.matched_count == 0:
+        raise HTTPException(409, "already punched out")
+    rec.update(update)
+    return record_out(rec)
+
+
 ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
 
 
@@ -370,7 +426,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - Part B (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
