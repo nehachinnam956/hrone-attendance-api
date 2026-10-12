@@ -126,6 +126,54 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Response shaping: the API never exposes _id, and every instant is epoch ms
+# --------------------------------------------------------------------------- #
+def _ms_if_dt(v):
+    return dt_to_ms(v) if isinstance(v, datetime) else v
+
+
+def employee_out(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": dt_to_ms(doc.get("created_at")),
+    }
+
+
+def history_out(entry: dict) -> dict:
+    return {
+        "at": dt_to_ms(entry.get("at")),
+        "by": entry.get("by"),
+        "reason": entry.get("reason"),
+        "changes": {
+            field: {"from": _ms_if_dt(ch.get("from")), "to": _ms_if_dt(ch.get("to"))}
+            for field, ch in (entry.get("changes") or {}).items()
+        },
+    }
+
+
+def record_out(doc: dict) -> dict:
+    """Missing late/overtime -> 0, half_day -> false, history -> [] (legacy records)."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": dt_to_ms(doc.get("punch_in")),
+        "punch_out": dt_to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day", False)),
+        "history": [history_out(h) for h in (doc.get("history") or [])],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
@@ -184,8 +232,7 @@ def create_employee(body: EmployeeIn):
         db.employees.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists")
-    doc.pop("_id", None)
-    return doc
+    return employee_out(doc)
 
 
 @app.get("/employees")
@@ -199,7 +246,8 @@ def list_employees(
         q["department"] = department
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
-    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size))
+    cursor = db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size)
+    items = [employee_out(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
@@ -224,12 +272,10 @@ def punch_in(body: PunchInIn):
     }
     # No check-then-insert: the unique (emp_code, date) index decides the race.
     try:
-        res = db.attendance_logs.insert_one(doc)
+        db.attendance_logs.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    return record_out(doc)
 
 
 @app.get("/attendance")
